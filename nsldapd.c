@@ -9,7 +9,10 @@
  * the License for the specific language governing rights and limitations
  * under the License.
  *
- * Copyright (C) 2001-2003 Vlad Seryakov
+ * Based on TinyLDAP from http://www.fefe.de/tinyldap/
+ * Thanks to Felix von Leitner <web@fefe.de>
+ *
+ * Copyright (C) 2001-2006 Vlad Seryakov
  * All rights reserved.
  *
  * Alternatively, the contents of this file may be used under the terms
@@ -336,6 +339,28 @@ typedef struct Filter {
    uint32_t flags;
 } Filter;
 
+typedef struct SearchResultEntry {
+   String objectName;
+   AttributeValues *attributes;
+} SearchResultEntry;
+
+typedef struct Modification {
+   struct Modification* next;
+   enum {
+     Add = 0,
+     Delete = 1,
+     Replace = 2
+   } operation;
+   String Attribute;
+   Attribute *values;
+} Modification;
+
+typedef struct Addition {
+   struct Addition* next;
+   String Attribute;
+   Attribute *values;
+} Addition;
+
 typedef struct BindRequest {
    uint32_t version;
    uint32_t method;
@@ -343,6 +368,13 @@ typedef struct BindRequest {
    String password;
    String mechanism;
 } BindRequest;
+
+typedef struct BindResponse {
+   uint32_t result;
+   String matcheddn;
+   String errmsg;
+   String referral;
+} BindResponse;
 
 typedef struct SearchRequest {
    enum {
@@ -364,36 +396,14 @@ typedef struct SearchRequest {
    Attribute *attributes;
 } SearchRequest;
 
-typedef struct SearchResultEntry {
-   String objectName;
-   AttributeValues* attributes;
-} SearchResultEntry;
-
-typedef struct Modification {
-   struct Modification* next;
-   enum {
-     Add = 0,
-     Delete = 1,
-     Replace = 2
-   } operation;
-   String Attribute;
-   Attribute vals;
-} Modification;
-
-typedef struct Addition {
-   struct Addition* next;
-   String Attribute;
-   Attribute vals;
-} Addition;
-
 typedef struct ModifyRequest {
    String object;
-   Modification m;
+   Modification *m;
 } ModifyRequest;
 
 typedef struct AddRequest {
    String entry;
-   Addition a;
+   Addition *a;
 } AddRequest;
 
 typedef struct LDAPServer {
@@ -426,6 +436,8 @@ typedef struct LDAPRequest {
    union {
      BindRequest bind;
      SearchRequest search;
+     AddRequest add;
+     ModifyRequest modify;
    };
 } LDAPRequest;
 
@@ -438,6 +450,7 @@ static void LDAPRequestProcess(LDAPRequest *arg);
 static void LDAPRequestFree(LDAPRequest *req);
 static int LDAPRequestProc(void *arg, Ns_Conn *conn);
 static int LDAPRequestReply(LDAPRequest *req, char *buf, int op);
+static int LDAPRequestReplySRE(LDAPRequest *req, SearchResultEntry *sre);
 static void LDAPRequestTcl(LDAPRequest *req);
 static int LDAPCallback(SOCKET sock, void *arg, int when);
 static int LDAPInterpInit(Tcl_Interp *interp, void *arg);
@@ -446,7 +459,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp,int objc,Tcl_Obj *CONST ob
 static uint32_t scan_ldapstring(const char* src, const char* max,String* s);
 static uint32_t scan_ldapmessage(const char* src, const char* max, uint32_t* messageid,uint32_t* op, uint32_t* len);
 static uint32_t scan_ldapbindrequest(const char* src, const char* max, BindRequest *bind);
-static uint32_t scan_ldapbindresponse(const char* src, const char* max, uint32_t* result, String *matcheddn, String *errmsg, String *referral);
+static uint32_t scan_ldapbindresponse(const char* src, const char* max, BindResponse *bind);
 static uint32_t scan_ldapsearchfilter(const char* src, const char* max, Filter** f);
 static uint32_t scan_ldapsearchrequest(const char* src, const char* max, SearchRequest* s);
 static uint32_t scan_ldapsearchresultentry(const char* src, const char* max, SearchResultEntry* sre);
@@ -600,12 +613,11 @@ static int LDAPDriverProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, i
      case DriverRecv:
         timeout.sec = sock->driver->recvwait;
         return Ns_SockRecvBufs(sock->sock, bufs, nbufs, &timeout);
-        break;
+
      case DriverSend:
         timeout.sec = sock->driver->sendwait;
         return Ns_SockSendBufs(sock->sock, bufs, nbufs, &timeout);
-        break;
-
+        
      case DriverClose:
      case DriverKeep:
          break;
@@ -727,6 +739,7 @@ static void LDAPRequestProcess(LDAPRequest* req)
                     Ns_Log(Notice, "LDAP: FD %d: %s: %u search: %s", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->msgid, req->ds.string);
                 }
                 LDAPRequestTcl(req);
+                free_ldapsearchrequest(&req->search);
             } else {
                 req->reply.rc = LDAP_PROTOCOLERROR;
             }
@@ -737,6 +750,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
         }
 
         case OP_MODIFYREQUEST:
+            if (scan_ldapmodifyrequest(buf + nread, buf + len, &req->modify) > 0) {
+                free_ldapmodifyrequest(&req->modify);
+            }
             req->reply.rc = LDAP_PROTOCOLERROR;
             if (LDAPRequestReply(req, buf, OP_MODIFYRESPONSE) <= 0) {
                 goto err;
@@ -744,6 +760,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             break;
 
         case OP_ADDREQUEST:
+            if (scan_ldapaddrequest(buf + nread, buf + len, &req->add) > 0) {
+                free_ldapaddrequest(&req->add);
+            }
             req->reply.rc = LDAP_OPERATIONSERROR;
             if (LDAPRequestReply(req, buf, OP_ADDRESPONSE) <= 0) {
                 goto err;
@@ -807,15 +826,34 @@ static int LDAPRequestReply(LDAPRequest *req, char *buf, int op)
     return Ns_SockSend(req->sock, outptr - mlen, rlen + mlen, &timeout);
 }
 
+static int LDAPRequestReplySRE(LDAPRequest *req, SearchResultEntry *sre)
+{
+    char *buf;
+    int rc, rlen, mlen;
+    Ns_Time timeout = {req->server->sendwait, 0};
+
+    rlen = fmt_ldapsearchresultentry(0, sre);
+    buf = ns_malloc(rlen + 32);
+    mlen = fmt_ldapmessage(buf, req->msgid, OP_SEARCHRESULTENTRY, rlen);
+    fmt_ldapsearchresultentry(buf + mlen, sre);
+    rc = Ns_SockSend(req->sock, buf, rlen + mlen, &timeout);
+    ns_free(buf);
+    return rc;
+}
+
 static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST objv[])
 {
+    LDAPServer *server = arg;
+    char buf[4096];
     LDAPRequest *req;
+    SearchResultEntry sre;
+    AttributeValues *attr;
     int i, j, cmd;
     enum commands {
-        cmdSend, cmdReqGet, cmdReqSet
+        cmdSearch, cmdReqGet, cmdReqSet, cmdReqResult
     };
     static const char *sCmd[] = {
-        "send", "reqget", "regset",
+        "search", "reqget", "regset", "reqresult",
         0
     };
 
@@ -891,8 +929,163 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         }
         break;
 
-     case cmdSend:
+     case cmdReqResult:
+        req = (LDAPRequest*)Ns_TlsGet(&ldapTls);
+        if (!req) {
+            break;
+        }
+        if (objc < 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "objname ?type value? ...");
+            return TCL_ERROR;
+        }
+        memset(&sre, 0, sizeof(sre));
+        sre.objectName.s = Tcl_GetStringFromObj(objv[2], (int*)&sre.objectName.l);
+        for (i = 3; i < objc - 1; i += 2) {
+            attr = ns_calloc(1, sizeof(AttributeValues));
+            attr->type.s = Tcl_GetStringFromObj(objv[i], (int*)&attr->type.l);
+            attr->values = ns_calloc(1, sizeof(Attribute));
+            attr->values->name.s = Tcl_GetStringFromObj(objv[i+1], (int*)&attr->values->name.l);
+            attr->next = sre.attributes;
+            sre.attributes = attr;
+        }
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(LDAPRequestReplySRE(req, &sre)));
+        free_ldapsearchresultentry(&sre);
         break;
+
+     case cmdSearch: {
+        Ns_DString ds;
+        Filter *filter;
+        BindRequest breq;
+        BindResponse bres;
+        SearchRequest sreq;
+        int nread, sock, len, port = 398;
+        uint32_t op, msgid = Ns_ThreadId();
+        uint32_t rlen, mlen, res;
+        Ns_Time timeout = {0, 0};
+
+        if (objc < 4) {
+            Tcl_WrongNumArgs(interp, 2, objv, "host filter ?binddn str? ?-port n? ?-user str? ?-password str? ?-attrs attr,attr,...?");
+            return TCL_ERROR;
+        }
+        memset(&sreq, 0, sizeof(sreq));
+        memset(&breq, 0, sizeof(breq));
+        memset(&bres, 0, sizeof(bres));
+
+        // Prepare Bind Reauest
+        rlen = fmt_ldapbindrequest(buf + 100, 3, (char*)breq.name.s, (char*)breq.password.s);
+        mlen = fmt_ldapmessage(0, msgid, OP_BINDREQUEST, rlen);
+        fmt_ldapmessage(buf + 100 - mlen, msgid, OP_BINDREQUEST, rlen);
+        timeout.sec = server->sendwait;
+        sock = Ns_SockTimedConnect(Tcl_GetString(objv[2]), port, &timeout);
+        if (sock == -1) {
+            Tcl_AppendResult(interp, "unable to connect to ", Tcl_GetString(objv[2]), 0);
+            return TCL_ERROR;
+        }
+        // Send request
+        if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
+            Tcl_AppendResult(interp, "timeout sending bind request to ", Tcl_GetString(objv[2]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        // Wait for the reply
+        timeout.sec = server->recvwait;
+        len = Ns_SockRecv(sock, buf, sizeof(buf), &timeout);
+        if (len <= 0) {
+            Tcl_AppendResult(interp, "timeout reading bind reply from ", Tcl_GetString(objv[2]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        // Parse reply
+        res = scan_ldapmessage(buf, buf + len, &msgid, &op, &mlen);
+        if (!res || op != OP_BINDRESPONSE) {
+            Tcl_AppendResult(interp, "invalid bind response from ", Tcl_GetString(objv[2]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        res = scan_ldapbindresponse(buf + res, buf + res + mlen, &bres);
+        if (!res || bres.result) {
+            Tcl_AppendResult(interp, "unable to bind to ", Tcl_GetString(objv[2]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        // Parse search filter
+        if (!scan_ldapsearchfilterstring(Tcl_GetString(objv[3]), &filter)) {
+            Tcl_AppendResult(interp, "invalid filter ", Tcl_GetString(objv[3]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        // Prepare Search Request
+        sreq.scope = wholeSubtree;
+        sreq.derefAliases = neverDerefAliases;
+        sreq.filter = filter;
+        rlen = fmt_ldapsearchrequest(buf + 100, &sreq);
+        mlen = fmt_ldapmessage(0, ++msgid, OP_SEARCHREQUEST, rlen);
+        fmt_ldapmessage(buf + 100 - mlen, msgid, OP_SEARCHREQUEST, rlen);
+        free_ldapfilter(filter);
+        timeout.sec = server->sendwait;
+        // Send request
+        if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
+            Tcl_AppendResult(interp, "timeout sending search request to ", Tcl_GetString(objv[2]), 0);
+            close(sock);
+            return TCL_ERROR;
+        }
+        timeout.sec = req->server->recvwait;
+        Ns_DStringInit(&ds);
+        len = 0;
+        while (1) {
+            // Wait for the reply
+            nread = Ns_SockRecv(sock, buf + len, sizeof(buf) - len, &timeout);
+            if (nread <= 0) {
+                Tcl_AppendResult(interp, "timeout reading search reply from ", Tcl_GetString(objv[2]), 0);
+                goto err;
+            }
+            len += nread;
+            // Parse reply
+            res = scan_ldapmessage(buf, buf + len, &msgid, &op, &mlen);
+            if (res <= 0) {
+                continue;
+            }
+            switch (op) {
+            case OP_SEARCHRESULTENTRY:
+                if (!(res = scan_ldapsearchresultentry(buf + res, buf + len, &sre))) {
+                    continue;
+                }
+                Ns_DStringAppend(&ds, "dn ");
+                Ns_DStringNAppend(&ds, sre.objectName.s, sre.objectName.l);
+                for (attr = sre.attributes; attr; attr = attr->next) {
+                     Ns_DStringAppend(&ds, " ");
+                     Ns_DStringNAppend(&ds, attr->type.s, attr->type.l);
+                     Ns_DStringAppend(&ds, " ");
+                     Ns_DStringNAppend(&ds, attr->values->name.s, attr->values->name.l);
+                }
+                free_ldapsearchresultentry(&sre);
+                break;
+
+            case OP_SEARCHRESULTDONE:
+                goto done;
+
+            default:
+                Tcl_AppendResult(interp, "invalid search response from ", Tcl_GetString(objv[2]), 0);
+                goto err;
+            }
+            mlen += nread;
+            if (mlen < len) {
+                memmove(buf, buf + mlen, len - mlen);
+                len -= mlen;
+            } else {
+                len = 0;
+            }
+        }
+done:
+        close(sock);
+        Tcl_AppendResult(interp, ds.string, 0);
+        Ns_DStringFree(&ds);
+        return TCL_OK;
+err:
+        close(sock);
+        Ns_DStringFree(&ds);
+        return TCL_ERROR;
+    }
     }
     return TCL_OK;
 }
@@ -1203,6 +1396,7 @@ static uint32_t scan_ldapbindrequest(const char *src, const char *max, BindReque
     ASN1TagClass tc;
     ASN1TagType tt;
 
+    memset(bind, 0, sizeof(BindRequest));
     if (!(res = scan_asn1INTEGER(src, max, (signed long *) &bind->version))) {
         return 0;
     }
@@ -1240,34 +1434,34 @@ static uint32_t scan_ldapbindrequest(const char *src, const char *max, BindReque
     return res;
 }
 
-static uint32_t scan_ldapbindresponse(const char *src, const char *max, uint32_t *result, String *matcheddn, String *errmsg, String *referral)
+static uint32_t scan_ldapbindresponse(const char *src, const char *max, BindResponse *bind)
 {
     uint32_t res, tmp;
 
-    if (!(res = scan_asn1ENUMERATED(src, max, result))) {
+    if (!(res = scan_asn1ENUMERATED(src, max, &bind->result))) {
         return 0;
     }
-    if (!(tmp = scan_ldapstring(src + res, max, matcheddn))) {
+    if (!(tmp = scan_ldapstring(src + res, max, &bind->matcheddn))) {
         return 0;
     }
     res += tmp;
     if (src + res < max) {
-        if (!(tmp = scan_ldapstring(src + res, max, errmsg))) {
+        if (!(tmp = scan_ldapstring(src + res, max, &bind->errmsg))) {
             return 0;
         }
         res += tmp;
     } else {
-        errmsg->s = 0;
-        errmsg->l = 0;
+        bind->errmsg.s = 0;
+        bind->errmsg.l = 0;
     }
     if (src + res < max) {
-        if (!(tmp = scan_ldapstring(src + res, max, referral))) {
+        if (!(tmp = scan_ldapstring(src + res, max, &bind->referral))) {
             return res;
         }
         res += tmp;
     } else {
-        referral->s = 0;
-        referral->l = 0;
+        bind->referral.s = 0;
+        bind->referral.l = 0;
     }
     return res;
 }
@@ -1278,7 +1472,8 @@ static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest
     uint32_t oslen;        /* outer sequence length */
     Addition *last = 0;
 
-    memset(a, 0, sizeof(*a));
+    memset(a, 0, sizeof(AddRequest));
+    a->a = ns_calloc(1, sizeof(Addition));
     if (!(res = scan_ldapstring(src, max, &a->entry))) {
         goto error;
     }
@@ -1303,7 +1498,7 @@ static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest
             last->next = cur;
             last = cur;
         } else {
-            last = &a->a;
+            last = a->a;
         }
         last->next = 0;
         if (!(tmp = scan_asn1SEQUENCE(src + res, max, &islen))) {
@@ -1338,7 +1533,7 @@ static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest
                     ilast->next = x;
                     ilast = ilast->next;
                 } else {
-                    ilast = &last->vals;
+                    ilast = last->values = ns_calloc(1, sizeof(Attribute));
                 }
                 ilast->next = 0;
                 if (!(tmp = scan_ldapstring(src + res, max, &ilast->name))) {
@@ -1360,7 +1555,8 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
     uint32_t oslen;        /* outer sequence length */
     Modification *last = 0;
 
-    m->m.next = 0;
+    memset(m, 0, sizeof(ModifyRequest));
+    m->m = ns_calloc(1, sizeof(Modification));
     if (!(res = scan_ldapstring(src, max, &m->object))) {
         goto error;
     }
@@ -1385,7 +1581,7 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
             last->next = cur;
             last = cur;
         } else {
-            last = &m->m;
+            last = m->m;
         }
         last->next = 0;
         if (!(tmp = scan_asn1SEQUENCE(src + res, max, &islen))) {
@@ -1436,7 +1632,7 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
                         x->next = ilast;
                         ilast = x;
                     } else {
-                        ilast = &last->vals;
+                        ilast = last->values = ns_calloc(1, sizeof(Attribute));
                     }
                     if (!(tmp = scan_ldapstring(src + res, imax, &ilast->name))) {
                         goto error;
@@ -2461,25 +2657,27 @@ static void free_ldapsearchrequest(SearchRequest *s)
 {
     free_ldapattr(s->attributes);
     free_ldapfilter(s->filter);
+    s->filter = NULL;
+    s->attributes = NULL;
 }
 
 static void free_ldapaddrequest(AddRequest *a)
 {
-    free_ldapattr(a->a.vals.next);
-    while (a->a.next) {
-        Addition *tmp = a->a.next->next;
+    while (a->a) {
+        Addition *tmp = a->a->next;
+        free_ldapattr(a->a->values);
         ns_free(a);
-        a->a.next = tmp;
+        a->a = tmp;
     }
 }
 
 static void free_ldapmodifyrequest(ModifyRequest *m)
 {
-    free_ldapattr(m->m.vals.next);
-    while (m->m.next) {
-        Modification *tmp = m->m.next->next;
+    while (m->m) {
+        Modification *tmp = m->m->next;
+        free_ldapattr(m->m->values);
         ns_free(m);
-        m->m.next = tmp;
+        m->m = tmp;
     }
 }
 
@@ -2491,7 +2689,6 @@ static void free_ldapattr(Attribute *a)
         a = tmp;
     }
 }
-
 
 static void free_ldapattrval(AttributeValues *a)
 {
@@ -2521,6 +2718,7 @@ static void free_ldapfilter(Filter *f)
 static void free_ldapsearchresultentry(SearchResultEntry *e)
 {
     free_ldapattrval(e->attributes);
+    e->attributes = NULL;
 }
 
 static void print_ldapfilter(Ns_DString *ds, Filter* f, int clear)

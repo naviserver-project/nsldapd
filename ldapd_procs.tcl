@@ -25,6 +25,7 @@ proc ldap::server { args } {
      search {
        # Search request
        ns_log notice ldap::server: [ns_ldap reqget search]
+       ns_log notice ldap:result: [ns_ldap reqresult vlad cn Vlad sn Seryakov email vlad@crystalballinc.com]
      }
      
      default {
