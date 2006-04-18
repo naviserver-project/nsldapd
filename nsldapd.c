@@ -893,6 +893,9 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "search")) {
             print_ldapsearch(&req->ds, &req->search, 0);
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "filter")) {
+            print_ldapfilter(&req->ds, req->search.filter, 0);
         }
         Tcl_AppendResult(interp, req->ds.string, 0);
         break;
@@ -958,8 +961,8 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         BindRequest breq;
         BindResponse bres;
         SearchRequest sreq;
-        int nread, sock, len, port = 398;
-        uint32_t op, msgid = Ns_ThreadId();
+        int nread, sock, len, port = 389;
+        uint32_t op, msgid = 1;
         uint32_t rlen, mlen, res;
         Ns_Time timeout = {0, 0};
 
@@ -983,7 +986,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         }
         // Send request
         if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
-            Tcl_AppendResult(interp, "timeout sending bind request to ", Tcl_GetString(objv[2]), 0);
+            Tcl_AppendResult(interp, "timeout sending bind request to ", Tcl_GetString(objv[2]), ": ", strerror(errno), 0);
             close(sock);
             return TCL_ERROR;
         }
@@ -991,7 +994,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         timeout.sec = server->recvwait;
         len = Ns_SockRecv(sock, buf, sizeof(buf), &timeout);
         if (len <= 0) {
-            Tcl_AppendResult(interp, "timeout reading bind reply from ", Tcl_GetString(objv[2]), 0);
+            Tcl_AppendResult(interp, "timeout reading bind reply from ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
             close(sock);
             return TCL_ERROR;
         }
@@ -1025,18 +1028,18 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         timeout.sec = server->sendwait;
         // Send request
         if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
-            Tcl_AppendResult(interp, "timeout sending search request to ", Tcl_GetString(objv[2]), 0);
+            Tcl_AppendResult(interp, "timeout sending search request to ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
             close(sock);
             return TCL_ERROR;
         }
-        timeout.sec = req->server->recvwait;
+        timeout.sec = server->recvwait;
         Ns_DStringInit(&ds);
         len = 0;
         while (1) {
             // Wait for the reply
             nread = Ns_SockRecv(sock, buf + len, sizeof(buf) - len, &timeout);
             if (nread <= 0) {
-                Tcl_AppendResult(interp, "timeout reading search reply from ", Tcl_GetString(objv[2]), 0);
+                Tcl_AppendResult(interp, "timeout reading search reply from ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
                 goto err;
             }
             len += nread;
@@ -1050,13 +1053,15 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
                 if (!(res = scan_ldapsearchresultentry(buf + res, buf + len, &sre))) {
                     continue;
                 }
-                Ns_DStringAppend(&ds, "dn ");
+                Ns_DStringAppend(&ds, "dn {");
                 Ns_DStringNAppend(&ds, sre.objectName.s, sre.objectName.l);
+                Ns_DStringAppend(&ds, "}");
                 for (attr = sre.attributes; attr; attr = attr->next) {
                      Ns_DStringAppend(&ds, " ");
                      Ns_DStringNAppend(&ds, attr->type.s, attr->type.l);
-                     Ns_DStringAppend(&ds, " ");
+                     Ns_DStringAppend(&ds, " {");
                      Ns_DStringNAppend(&ds, attr->values->name.s, attr->values->name.l);
+                     Ns_DStringAppend(&ds, "}");
                 }
                 free_ldapsearchresultentry(&sre);
                 break;
@@ -1077,6 +1082,9 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
             }
         }
 done:
+        mlen = fmt_ldapmessage(buf, ++msgid, OP_UNBINDREQUEST, 0);
+        timeout.sec = 0;
+        Ns_SockSend(sock, buf, mlen, &timeout);
         close(sock);
         Tcl_AppendResult(interp, ds.string, 0);
         Ns_DStringFree(&ds);
@@ -1092,9 +1100,16 @@ err:
 
 static uint32_t scan_strchr(const char *in, char needle)
 {
-    register const char *t = strchr(in, needle);
-    return t ? t - in : 0;
+  register const char *t = in, c = needle;
+  for (;;) {
+      if (!*t || *t==c) break; ++t;
+      if (!*t || *t==c) break; ++t;
+      if (!*t || *t==c) break; ++t;
+      if (!*t || *t==c) break; ++t;
+  }
+  return t - in;
 }
+
 
 static uint32_t scan_asn1BOOLEAN(const char *src, const char *max, uint32_t *l)
 {
@@ -2110,7 +2125,7 @@ substring:
         (*f)->value.s = s;
         s += (*f)->value.l = scan_strchr(s, ')');
         if (*s != ')') {
-            return 0;
+            goto error;
         }
     }
     return s - src + 1;
@@ -2321,8 +2336,11 @@ static uint32_t fmt_ldapavl(char *dest, Attribute *adl)
 
 static uint32_t fmt_ldapbindrequest(char *dest, long version, char *name, char *simple)
 {
-    uint32_t l, sum, nlen = strlen(name);
+    uint32_t l, sum, nlen;
 
+    name = name != NULL ? name : "";
+    simple = simple != NULL ? simple : "";
+    nlen = strlen(name);
     sum = l = fmt_asn1INTEGER(dest, version);
     if (dest) {
         dest += l;
@@ -2384,6 +2402,9 @@ static uint32_t fmt_ldapresult(char *dest, long result, char *matcheddn, char *e
 {
     uint32_t l, sum = 0, nlen;
 
+    matcheddn = matcheddn != NULL ? matcheddn : "";
+    errmsg = errmsg != NULL ? errmsg : "";
+    referral = referral != NULL ? referral : "";
     sum = l = fmt_asn1ENUMERATED(dest, result);
     if (dest) {
         dest += l;
@@ -2791,14 +2812,14 @@ static void print_ldapfilter(Ns_DString *ds, Filter* f, int clear)
 
      case APPROX:
          Ns_DStringNAppend(ds, f->value.s, f->value.l);
-         Ns_DStringAppend(ds, " ~= {");
+         Ns_DStringAppend(ds, " approx {");
          Ns_DStringNAppend(ds, f->name.s, f->name.l);
          Ns_DStringAppend(ds, "}");
          break;
 
      case PRESENT:
          Ns_DStringNAppend(ds, f->value.s, f->value.l);
-         Ns_DStringAppend(ds, " ~ {");
+         Ns_DStringAppend(ds, " exists {");
          Ns_DStringNAppend(ds, f->name.s, f->name.l);
          Ns_DStringAppend(ds, "}");
          break;

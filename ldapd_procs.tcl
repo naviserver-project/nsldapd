@@ -24,8 +24,11 @@ proc ldap::server { args } {
      
      search {
        # Search request
-       ns_log notice ldap::server: [ns_ldap reqget search]
-       ns_log notice ldap:result: [ns_ldap reqresult vlad cn Vlad sn Seryakov email vlad@crystalballinc.com]
+       array set req [ns_ldap reqget search]
+       ns_log notice ldap::server: [array get req]
+       ns_log notice ldap::server: tcl: [ldap::build_filter_tcl $req(filter) "\$%s"]
+       ns_log notice ldap::server: sql: [ldap::build_filter_sql $req(filter) "attrname='%s' AND attrvalue"]
+       #ns_ldap reqresult vlad cn "Vlad Seryakov" mail vlad@crystalballinc.com
      }
      
      default {
@@ -36,3 +39,66 @@ proc ldap::server { args } {
     }
 }
 
+
+# Build Tcl code from the filter, tmpl is how to substitute/convert
+# attribute name which is specified by %s, i.e. "\$%s" or \[varname %s\]
+proc ldap::build_filter_tcl { filter tmpl { op && } } {
+
+    set code ""
+    foreach { left oper right } $filter {
+      if { $code != "" } { append code " " $op " " }
+      set var [string map [list %s $left] $tmpl]
+      switch -- $oper {
+       | { append code "([ldap::build_filter_tcl $right $tmpl ||])" }
+       
+       & { append code "([ldap::build_filter_tcl $right $tmpl])" }
+       
+       ! { append code "!([ldap::build_filter_tcl $right $tmpl])" }
+       
+       == -
+       <= -
+       >= { append code "($var $oper {$right})" }
+       
+       prefix { append code "(\[string match -nocase {$right*} $var\])" }
+       
+       suffix { append code "(\[string match -nocase {*$right} $var\])" }
+       
+       exists -
+       approx -
+       substr { append code "(\[string match -nocase {*$right*} $var\])" }
+      }
+    }
+    return $code
+}
+
+# Build SQL code from the filter, tmpl is how to substitute/convert
+# attribute name which is specified by %s, i.e. "attrname='%s' AND attrvalue" or "attr_value('%s')"
+proc ldap::build_filter_sql { filter tmpl { op AND } } {
+
+    set code ""
+    foreach { left oper right } $filter {
+      if { $code != "" } { append code " " $op " " }
+      set var [string map [list %s $left] $tmpl]
+      switch -- $oper {
+       | { append code "([ldap::build_filter_sql $right $tmpl OR])" }
+       
+       & { append code "([ldap::build_filter_sql $right $tmpl])" }
+       
+       ! { append code "NOT ([ldap::build_filter_sql $right $tmpl])" }
+       
+       == { append code "($var = '$right')" }
+
+       <= -
+       >= { append code "($var $oper '$right')" }
+       
+       prefix { append code "($var ILIKE '$right%')" }
+       
+       suffix { append code "($var ILIKE '%$right')" }
+       
+       exists -
+       approx -
+       substr { append code "($var ILIKE '%$right%')" }
+      }
+    }
+    return $code
+}
