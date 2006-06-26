@@ -344,22 +344,16 @@ typedef struct SearchResultEntry {
    AttributeValues *attributes;
 } SearchResultEntry;
 
-typedef struct Modification {
-   struct Modification* next;
+typedef struct Modify {
+   struct Modify* next;
    enum {
      Add = 0,
      Delete = 1,
      Replace = 2
    } operation;
-   String Attribute;
+   String attribute;
    Attribute *values;
-} Modification;
-
-typedef struct Addition {
-   struct Addition* next;
-   String Attribute;
-   Attribute *values;
-} Addition;
+} Modify;
 
 typedef struct BindRequest {
    uint32_t version;
@@ -398,13 +392,8 @@ typedef struct SearchRequest {
 
 typedef struct ModifyRequest {
    String object;
-   Modification *m;
+   Modify *m;
 } ModifyRequest;
-
-typedef struct AddRequest {
-   String entry;
-   Addition *a;
-} AddRequest;
 
 typedef struct LDAPServer {
    char *name;
@@ -436,7 +425,6 @@ typedef struct LDAPRequest {
    union {
      BindRequest bind;
      SearchRequest search;
-     AddRequest add;
      ModifyRequest modify;
    };
 } LDAPRequest;
@@ -465,7 +453,7 @@ static uint32_t scan_ldapsearchrequest(const char* src, const char* max, SearchR
 static uint32_t scan_ldapsearchresultentry(const char* src, const char* max, SearchResultEntry* sre);
 static uint32_t scan_ldapresult(const char* src, const char* max, uint32_t* result, String *matcheddn, String *errmsg, String *referral);
 static uint32_t scan_ldapmodifyrequest(const char* src,const char* max, ModifyRequest* m);
-static uint32_t scan_ldapaddrequest(const char * src, const char * max, AddRequest * a);
+static uint32_t scan_ldapaddrequest(const char * src, const char * max, ModifyRequest * a);
 static uint32_t scan_ldapsearchfilterstring(const char* src, Filter** f);
 
 static uint32_t fmt_ldapstring(char* dest, String* s);
@@ -493,7 +481,7 @@ static void free_ldapattrval(AttributeValues* a);
 static void free_ldapfilter(Filter* f);
 static void free_ldapsearchrequest(SearchRequest* s);
 static void free_ldapmodifyrequest(ModifyRequest* m);
-static void free_ldapaddrequest(AddRequest * a);
+static void free_ldapaddrequest(ModifyRequest * a);
 static void free_ldapsearchresultentry(SearchResultEntry* e);
 
 static uint32_t fmt_asn1tag(char* dest, ASN1TagClass tc, ASN1TagType tt, uint32_t tag);
@@ -520,6 +508,7 @@ static uint32_t scan_asn1SET(const char* src, const char* max, uint32_t* len);
 static void print_ldapfilter(Ns_DString *ds, Filter* f, int clear);
 static void print_ldapsearch(Ns_DString *ds, SearchRequest* s, int clear);
 static void print_ldapbind(Ns_DString *ds, BindRequest* b, int clear);
+static void print_ldapmodify(Ns_DString *ds, ModifyRequest* m, int clear);
 
 const char* ldapScopes[] = { "baseObject", "singleLevel", "wholeSubtree" };
 const char* ldapAliases[] = { "neverDerefAliases", "derefInSearching", "derefFindingBaseObj", "derefAlways" };
@@ -751,6 +740,7 @@ static void LDAPRequestProcess(LDAPRequest* req)
 
         case OP_MODIFYREQUEST:
             if (scan_ldapmodifyrequest(buf + nread, buf + len, &req->modify) > 0) {
+                LDAPRequestTcl(req);
                 free_ldapmodifyrequest(&req->modify);
             }
             req->reply.rc = LDAP_PROTOCOLERROR;
@@ -760,8 +750,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             break;
 
         case OP_ADDREQUEST:
-            if (scan_ldapaddrequest(buf + nread, buf + len, &req->add) > 0) {
-                free_ldapaddrequest(&req->add);
+            if (scan_ldapaddrequest(buf + nread, buf + len, &req->modify) > 0) {
+                LDAPRequestTcl(req);
+                free_ldapaddrequest(&req->modify);
             }
             req->reply.rc = LDAP_OPERATIONSERROR;
             if (LDAPRequestReply(req, buf, OP_ADDRESPONSE) <= 0) {
@@ -896,6 +887,9 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "filter")) {
             print_ldapfilter(&req->ds, req->search.filter, 0);
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "modify")) {
+            print_ldapmodify(&req->ds, &req->modify, 0);
         }
         Tcl_AppendResult(interp, req->ds.string, 0);
         break;
@@ -1407,14 +1401,16 @@ static uint32_t scan_ldapmessage(const char *src, const char *max, uint32_t *mes
 
 static uint32_t scan_ldapbindrequest(const char *src, const char *max, BindRequest *bind)
 {
+    signed long version;
     uint32_t res, tmp;
     ASN1TagClass tc;
     ASN1TagType tt;
 
     memset(bind, 0, sizeof(BindRequest));
-    if (!(res = scan_asn1INTEGER(src, max, (signed long *) &bind->version))) {
+    if (!(res = scan_asn1INTEGER(src, max, &version))) {
         return 0;
     }
+    bind->version = version;
     if (!(tmp = scan_ldapstring(src + res, max, &bind->name))) {
         return 0;
     }
@@ -1481,15 +1477,15 @@ static uint32_t scan_ldapbindresponse(const char *src, const char *max, BindResp
     return res;
 }
 
-static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest *a)
+static uint32_t scan_ldapaddrequest(const char *src, const char *max, ModifyRequest *a)
 {
     uint32_t res, tmp;
     uint32_t oslen;        /* outer sequence length */
-    Addition *last = 0;
+    Modify *last = 0;
 
-    memset(a, 0, sizeof(AddRequest));
-    a->a = ns_calloc(1, sizeof(Addition));
-    if (!(res = scan_ldapstring(src, max, &a->entry))) {
+    memset(a, 0, sizeof(ModifyRequest));
+    a->m = ns_calloc(1, sizeof(Modify));
+    if (!(res = scan_ldapstring(src, max, &a->object))) {
         goto error;
     }
     if (!(tmp = scan_asn1SEQUENCE(src + res, max, &oslen))) {
@@ -1506,14 +1502,14 @@ static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest
     do {
         uint32_t islen;
         if (last) {
-            Addition *cur;
-            if (!(cur = ns_malloc(sizeof(Addition)))) {
+            Modify *cur;
+            if (!(cur = ns_malloc(sizeof(Modify)))) {
                 goto error;
             }
             last->next = cur;
             last = cur;
         } else {
-            last = a->a;
+            last = a->m;
         }
         last->next = 0;
         if (!(tmp = scan_asn1SEQUENCE(src + res, max, &islen))) {
@@ -1521,7 +1517,7 @@ static uint32_t scan_ldapaddrequest(const char *src, const char *max, AddRequest
         }
         res += tmp;
         /* scan Attribute: */
-        if (!(tmp = scan_ldapstring(src + res, max, &last->Attribute))) {
+        if (!(tmp = scan_ldapstring(src + res, max, &last->attribute))) {
             goto error;
         }
         res += tmp;
@@ -1568,10 +1564,10 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
 {
     uint32_t res, tmp;
     uint32_t oslen;        /* outer sequence length */
-    Modification *last = 0;
+    Modify *last = 0;
 
     memset(m, 0, sizeof(ModifyRequest));
-    m->m = ns_calloc(1, sizeof(Modification));
+    m->m = ns_calloc(1, sizeof(Modify));
     if (!(res = scan_ldapstring(src, max, &m->object))) {
         goto error;
     }
@@ -1589,8 +1585,8 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
     do {
         uint32_t islen, etmp;
         if (last) {
-            Modification *cur;
-            if (!(cur = ns_malloc(sizeof(Modification)))) {
+            Modify *cur;
+            if (!(cur = ns_malloc(sizeof(Modify)))) {
                 goto error;
             }
             last->next = cur;
@@ -1622,7 +1618,7 @@ static uint32_t scan_ldapmodifyrequest(const char *src, const char *max, ModifyR
             if (imax > max) {
                 goto error;
             }
-            if (!(tmp = scan_ldapstring(src + res, imax, &last->Attribute))) {
+            if (!(tmp = scan_ldapstring(src + res, imax, &last->attribute))) {
                 goto error;
             }
             res += tmp;
@@ -2682,20 +2678,20 @@ static void free_ldapsearchrequest(SearchRequest *s)
     s->attributes = NULL;
 }
 
-static void free_ldapaddrequest(AddRequest *a)
+static void free_ldapaddrequest(ModifyRequest *a)
 {
-    while (a->a) {
-        Addition *tmp = a->a->next;
-        free_ldapattr(a->a->values);
+    while (a->m) {
+        Modify *tmp = a->m->next;
+        free_ldapattr(a->m->values);
         ns_free(a);
-        a->a = tmp;
+        a->m = tmp;
     }
 }
 
 static void free_ldapmodifyrequest(ModifyRequest *m)
 {
     while (m->m) {
-        Modification *tmp = m->m->next;
+        Modify *tmp = m->m->next;
         free_ldapattr(m->m->values);
         ns_free(m);
         m->m = tmp;
@@ -2871,5 +2867,26 @@ static void print_ldapbind(Ns_DString *ds, BindRequest* b, int clear)
     Ns_DStringNAppend(ds, b->password.s, b->password.l);
     Ns_DStringAppend(ds, "} mechanism {");
     Ns_DStringNAppend(ds, b->mechanism.s, b->mechanism.l);
+    Ns_DStringAppend(ds, "}");
+}
+
+static void print_ldapmodify(Ns_DString *ds, ModifyRequest* m, int clear)
+{
+    Attribute *val = m->m->values;
+
+    if (clear) {
+        Ns_DStringSetLength(ds, 0);
+    }
+    Ns_DStringPrintf(ds, "op %s object {",m->m->operation == Add ? "add" : m->m->operation == Delete ? "delete" : "relpace");
+    Ns_DStringNAppend(ds, m->object.s, m->object.l);
+    Ns_DStringAppend(ds, "} attribute {");
+    Ns_DStringNAppend(ds, m->m->attribute.s, m->m->attribute.l);
+    Ns_DStringAppend(ds, "} values {");
+    while (val) {
+        Ns_DStringNAppend(ds, val->name.s, val->name.l);
+        if ((val = val->next)) {
+            Ns_DStringAppend(ds, " ");
+        }
+    }
     Ns_DStringAppend(ds, "}");
 }

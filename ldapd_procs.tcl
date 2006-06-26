@@ -30,6 +30,13 @@ proc ldap::server { args } {
        ns_log notice ldap::server: sql: [ldap::build_filter_sql $req(filter) "attrname='%s' AND attrvalue"]
        #ns_ldap reqresult vlad cn "Vlad Seryakov" mail vlad@crystalballinc.com
      }
+
+     add -
+     modify {
+       # Modify request
+       array set req [ns_ldap reqget modify]
+       ns_log notice ldap::server: [array get req]
+     }
      
      default {
        # Set protocolerror for allother requests
