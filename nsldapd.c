@@ -432,6 +432,7 @@ typedef struct LDAPRequest {
 int ldap_process(LDAPRequest *req);
 
 
+static Ns_SockProc LDAPSockProc;
 static Ns_DriverProc LDAPDriverProc;
 static LDAPRequest *LDAPRequestNew(LDAPServer *server);
 static void LDAPRequestProcess(LDAPRequest *arg);
@@ -440,7 +441,6 @@ static int LDAPRequestProc(void *arg, Ns_Conn *conn);
 static int LDAPRequestReply(LDAPRequest *req, char *buf, int op);
 static int LDAPRequestReplySRE(LDAPRequest *req, SearchResultEntry *sre);
 static void LDAPRequestTcl(LDAPRequest *req);
-static int LDAPCallback(SOCKET sock, void *arg, int when);
 static int LDAPInterpInit(Tcl_Interp *interp, void *arg);
 static int LDAPCmd(ClientData arg, Tcl_Interp *interp,int objc,Tcl_Obj *CONST objv[]);
 
@@ -578,7 +578,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
             ns_free(srvPtr);
             return NS_ERROR;
         }
-        Ns_SockCallback(srvPtr->sock, LDAPCallback, srvPtr, NS_SOCK_READ|NS_SOCK_EXIT|NS_SOCK_EXCEPTION);
+        Ns_SockCallback(srvPtr->sock, LDAPSockProc, srvPtr, NS_SOCK_READ|NS_SOCK_EXIT|NS_SOCK_EXCEPTION);
     }
     srvPtr->name = ns_strdup(server);
     Ns_TclRegisterTrace(server, LDAPInterpInit, srvPtr, NS_TCL_TRACE_CREATE);
@@ -606,7 +606,7 @@ static int LDAPDriverProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, i
      case DriverSend:
         timeout.sec = sock->driver->sendwait;
         return Ns_SockSendBufs(sock->sock, bufs, nbufs, &timeout);
-        
+
      case DriverClose:
      case DriverKeep:
          break;
@@ -634,7 +634,7 @@ static void LDAPThread(void *arg)
     LDAPRequestFree(req);
 }
 
-static int LDAPCallback(SOCKET sock, void *arg, int when)
+static int LDAPSockProc(SOCKET sock, void *arg, int when)
 {
     LDAPServer *server = (LDAPServer*)arg;
     int slen = sizeof(struct sockaddr_in);
