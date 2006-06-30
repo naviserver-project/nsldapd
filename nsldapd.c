@@ -563,7 +563,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
         init.version = NS_DRIVER_VERSION_1;
         init.name = "nsldapd";
         init.proc = LDAPDriverProc;
-        init.opts = 0;
+        init.opts = NS_DRIVER_QUEUE_ONACCEPT;
         init.arg = srvPtr;
         init.path = NULL;
         if (Ns_DriverInit(server, module, &init) != NS_OK) {
@@ -596,16 +596,19 @@ static int LDAPDriverProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, i
     Ns_Time timeout = {0,0};
 
     switch (cmd) {
-     case DriverAccept:
-         return Ns_DriverSockRequest(sock, "LDAP / LDAP/1.0");
+     case DriverQueue:
+         return Ns_DriverSetRequest(sock, "LDAP / LDAP/1.0");
+         break;
 
      case DriverRecv:
         timeout.sec = sock->driver->recvwait;
         return Ns_SockRecvBufs(sock->sock, bufs, nbufs, &timeout);
+        break;
 
      case DriverSend:
         timeout.sec = sock->driver->sendwait;
         return Ns_SockSendBufs(sock->sock, bufs, nbufs, &timeout);
+        break;
 
      case DriverClose:
      case DriverKeep:
