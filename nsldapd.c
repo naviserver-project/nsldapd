@@ -759,8 +759,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             if (scan_ldapmodifyrequest(buf + nread, buf + len, &req->modify) > 0) {
                 LDAPRequestTcl(req);
                 free_ldapmodifyrequest(&req->modify);
+            } else {
+                req->reply.rc = LDAP_PROTOCOLERROR;
             }
-            req->reply.rc = LDAP_PROTOCOLERROR;
             if (LDAPRequestReply(req, buf, OP_MODIFYRESPONSE) <= 0) {
                 goto err;
             }
@@ -770,8 +771,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             if (scan_ldapaddrequest(buf + nread, buf + len, &req->modify) > 0) {
                 LDAPRequestTcl(req);
                 free_ldapaddrequest(&req->modify);
+            } else {
+                req->reply.rc = LDAP_OPERATIONSERROR;
             }
-            req->reply.rc = LDAP_OPERATIONSERROR;
             if (LDAPRequestReply(req, buf, OP_ADDRESPONSE) <= 0) {
                 goto err;
             }
@@ -807,7 +809,9 @@ done:
     return;
 
 err:
-    Ns_Log(Error, "nsldapd: %d: error: %s", req->sock, strerror(errno));
+    if (errno != EWOULDBLOCK) {
+        Ns_Log(Error, "nsldapd: %d: error: %s", req->sock, strerror(errno));
+    }
     goto done;
 }
 
