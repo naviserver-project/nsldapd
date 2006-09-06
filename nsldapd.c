@@ -299,6 +299,19 @@ typedef enum LDAPError {
   LDAP_AFFECTSMULTIPLEDSAS           = 71,
 } LDAPError;
 
+typedef enum LDAPScope {
+  baseObject   = 0,
+  singleLevel  = 1,
+  wholeSubtree = 2
+} LDAPScope;
+
+typedef enum LDAPDerefAliases {
+  neverDerefAliases    = 0,
+  derefInSearching     = 1,
+  derefFindingBaseObj  = 2,
+  derefAlways          = 3
+} LDAPDerefAliases;
+
 #define MAX_OPS                      25
 #define MAX_BINDS                    4
 #define MAX_ERRORS                   72
@@ -371,17 +384,8 @@ typedef struct BindResponse {
 } BindResponse;
 
 typedef struct SearchRequest {
-   enum {
-     baseObject = 0,
-     singleLevel = 1,
-     wholeSubtree = 2
-   } scope;
-   enum {
-     neverDerefAliases = 0,
-     derefInSearching = 1,
-     derefFindingBaseObj = 2,
-     derefAlways = 3
-   } derefAliases;
+   LDAPScope scope;
+   LDAPDerefAliases derefAliases;
    String baseObject;
    uint32_t sizeLimit;
    uint32_t timeLimit;
@@ -413,6 +417,7 @@ typedef struct LDAPRequest {
    struct sockaddr_in sa;
    Ns_DString ds;
    int sock;
+   int authenticated;
    uint32_t op;
    uint32_t msgid;
    uint32_t msglen;
@@ -428,9 +433,6 @@ typedef struct LDAPRequest {
      ModifyRequest modify;
    };
 } LDAPRequest;
-
-int ldap_process(LDAPRequest *req);
-
 
 static Ns_SockProc LDAPSockProc;
 static Ns_DriverProc LDAPDriverProc;
@@ -510,12 +512,23 @@ static void print_ldapsearch(Ns_DString *ds, SearchRequest* s, int clear);
 static void print_ldapbind(Ns_DString *ds, BindRequest* b, int clear);
 static void print_ldapmodify(Ns_DString *ds, ModifyRequest* m, int clear);
 
-const char* ldapScopes[] = { "baseObject", "singleLevel", "wholeSubtree" };
-const char* ldapAliases[] = { "neverDerefAliases", "derefInSearching", "derefFindingBaseObj", "derefAlways" };
+static Ns_ObjvTable ldapScopes[] = { { "baseObject", baseObject },
+                                     { "singleLevel", singleLevel },
+                                     { "wholeSubtree", wholeSubtree },
+                                     { NULL, 0 } };
+
+static Ns_ObjvTable ldapAliases[] = { { "neverDerefAliases", neverDerefAliases },
+                                      { "derefInSearching", derefInSearching },
+                                      { "derefFindingBaseObj", derefFindingBaseObj },
+                                      { "derefAlways", derefAlways },
+                                      { NULL, 0 } };
+
 const char *ldapBinds[] = { "simple", "1", "2", "sasl" };
+
 const char *ldapOps[] = { "bind", "bind", "unbind", "search", "searchresultentry", "searchresultdone", "modify",
                           "modify","add", "add", "del", "del", "modifydn", "modifydn", "compare", "compare",
                           "abandon", "17", "18", "19", "20", "21", "22", "extended", "extended" };
+
 const char *ldapErrors[] = { "success", "operationserror", "protocolerror", "timelimitexceeded", "sizelimitexceeded",
                              "comparefalse", "comparetrue", "authmethodnotsupported", "strongauthrequired", "referral",
                              "adminlimitexceeded", "unavailablecriticalextension", "confidentialityrequired",
@@ -718,6 +731,7 @@ static void LDAPRequestProcess(LDAPRequest* req)
                 print_ldapbind(&req->ds, &req->bind, 1);
                 Ns_Log(Notice, "LDAP: FD %d: %s: %u bind: %s", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->msgid, req->ds.string);
             }
+            req->authenticated = req->reply.rc ? 0 : 1;
             if (LDAPRequestReply(req, buf, OP_BINDRESPONSE) <= 0) {
                 goto err;
             }
@@ -885,6 +899,9 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         if (!strcmp(Tcl_GetString(objv[2]), "bind")) {
             print_ldapbind(&req->ds, &req->bind, 0);
         } else
+        if (!strcmp(Tcl_GetString(objv[2]), "authenticated")) {
+            Ns_DStringPrintf(&req->ds, "%d", req->authenticated);
+        } else
         if (!strcmp(Tcl_GetString(objv[2]), "search")) {
             print_ldapsearch(&req->ds, &req->search, 0);
         } else
@@ -958,85 +975,109 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         BindRequest breq;
         BindResponse bres;
         SearchRequest sreq;
-        int nread, sock, len, port = 389;
         uint32_t op, msgid = 1;
         uint32_t rlen, mlen, res;
-        Ns_Time timeout = {0, 0};
+        int nread, sock, len, bind = 1, port = 389;
+        char *hoststr = NULL, *filterstr = NULL, *attrstr = NULL;
+        Ns_Time sendtimeout = {server->sendwait, 0};
+        Ns_Time recvtimeout = {server->recvwait, 0};
 
-        if (objc < 4) {
-            Tcl_WrongNumArgs(interp, 2, objv, "host filter ?binddn str? ?-port n? ?-user str? ?-password str? ?-attrs attr,attr,...?");
-            return TCL_ERROR;
-        }
+        Ns_ObjvSpec Opts[] = {
+            {"-bind",        Ns_ObjvInt,    &bind,              NULL},
+            {"-port",        Ns_ObjvInt,    &port,              NULL},
+            {"-sendtimeout", Ns_ObjvInt,    &sendtimeout.sec,   NULL},
+            {"-recvtimeout", Ns_ObjvInt,    &recvtimeout.sec,   NULL},
+            {"-user",        Ns_ObjvString, &breq.name.s,       &breq.name.l},
+            {"-password",    Ns_ObjvString, &breq.password.s,   &breq.password.l},
+            {"-basedn",      Ns_ObjvString, &sreq.baseObject.s, &sreq.baseObject.l},
+            {"-attrs",       Ns_ObjvString, &attrstr,           NULL},
+            {"-scope",       Ns_ObjvIndex,  &sreq.scope,        &ldapScopes},
+            {"-deref",       Ns_ObjvIndex,  &sreq.derefAliases, &ldapAliases},
+            {"--",           Ns_ObjvBreak,  NULL,               NULL},
+            {NULL, NULL, NULL, NULL}
+        };
+        Ns_ObjvSpec Args[] = {
+            {"host",       Ns_ObjvString, &hoststr,      NULL},
+            {"filter",     Ns_ObjvString, &filterstr,    NULL},
+            {NULL, NULL, NULL, NULL}
+        };
+
         memset(&sreq, 0, sizeof(sreq));
         memset(&breq, 0, sizeof(breq));
         memset(&bres, 0, sizeof(bres));
+        sreq.scope = wholeSubtree;
+        sreq.derefAliases = neverDerefAliases;
+
+        if (Ns_ParseObjv(Opts, Args, interp, 2, objc, objv) != NS_OK) {
+            return TCL_ERROR;
+        }
+
+        sock = Ns_SockTimedConnect(hoststr, port, &sendtimeout);
+        if (sock == -1) {
+            Tcl_AppendResult(interp, "unable to connect to ", hoststr, 0);
+            return TCL_ERROR;
+        }
 
         // Prepare Bind Reauest
-        rlen = fmt_ldapbindrequest(buf + 100, 3, (char*)breq.name.s, (char*)breq.password.s);
-        mlen = fmt_ldapmessage(0, msgid, OP_BINDREQUEST, rlen);
-        fmt_ldapmessage(buf + 100 - mlen, msgid, OP_BINDREQUEST, rlen);
-        timeout.sec = server->sendwait;
-        sock = Ns_SockTimedConnect(Tcl_GetString(objv[2]), port, &timeout);
-        if (sock == -1) {
-            Tcl_AppendResult(interp, "unable to connect to ", Tcl_GetString(objv[2]), 0);
-            return TCL_ERROR;
+        if (bind) {
+            rlen = fmt_ldapbindrequest(buf + 100, 3, (char*)breq.name.s, (char*)breq.password.s);
+            mlen = fmt_ldapmessage(0, msgid, OP_BINDREQUEST, rlen);
+            fmt_ldapmessage(buf + 100 - mlen, msgid, OP_BINDREQUEST, rlen);
+            // Send request
+            if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &sendtimeout) <= 0) {
+                Tcl_AppendResult(interp, "timeout sending bind request to ", hoststr, ": ", strerror(errno), 0);
+                close(sock);
+                return TCL_ERROR;
+            }
+            // Wait for the reply
+            len = Ns_SockRecv(sock, buf, sizeof(buf), &recvtimeout);
+            if (len <= 0) {
+                Tcl_AppendResult(interp, "timeout reading bind reply from ", hoststr, " ", strerror(errno), 0);
+                close(sock);
+                return TCL_ERROR;
+            }
+            // Parse reply
+            res = scan_ldapmessage(buf, buf + len, &msgid, &op, &mlen);
+            if (!res || op != OP_BINDRESPONSE) {
+                Tcl_AppendResult(interp, "invalid bind response from ", hoststr, 0);
+                close(sock);
+                return TCL_ERROR;
+            }
+            res = scan_ldapbindresponse(buf + res, buf + res + mlen, &bres);
+            if (!res || bres.result) {
+                Tcl_AppendResult(interp, "unable to bind to ", hoststr, ": ",
+                                 bres.result < MAX_ERRORS ? ldapErrors[bres.result] : "", " ",
+                                 bres.errmsg.s, 0);
+                close(sock);
+                return TCL_ERROR;
+            }
         }
-        // Send request
-        if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
-            Tcl_AppendResult(interp, "timeout sending bind request to ", Tcl_GetString(objv[2]), ": ", strerror(errno), 0);
-            close(sock);
-            return TCL_ERROR;
-        }
-        // Wait for the reply
-        timeout.sec = server->recvwait;
-        len = Ns_SockRecv(sock, buf, sizeof(buf), &timeout);
-        if (len <= 0) {
-            Tcl_AppendResult(interp, "timeout reading bind reply from ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
-            close(sock);
-            return TCL_ERROR;
-        }
-        // Parse reply
-        res = scan_ldapmessage(buf, buf + len, &msgid, &op, &mlen);
-        if (!res || op != OP_BINDRESPONSE) {
-            Tcl_AppendResult(interp, "invalid bind response from ", Tcl_GetString(objv[2]), 0);
-            close(sock);
-            return TCL_ERROR;
-        }
-        res = scan_ldapbindresponse(buf + res, buf + res + mlen, &bres);
-        if (!res || bres.result) {
-            Tcl_AppendResult(interp, "unable to bind to ", Tcl_GetString(objv[2]), 0);
-            close(sock);
-            return TCL_ERROR;
-        }
+
         // Parse search filter
-        if (!scan_ldapsearchfilterstring(Tcl_GetString(objv[3]), &filter)) {
-            Tcl_AppendResult(interp, "invalid filter ", Tcl_GetString(objv[3]), 0);
+        if (!scan_ldapsearchfilterstring(filterstr, &filter)) {
+            Tcl_AppendResult(interp, "invalid filter ", filterstr, 0);
             close(sock);
             return TCL_ERROR;
         }
         // Prepare Search Request
-        sreq.scope = wholeSubtree;
-        sreq.derefAliases = neverDerefAliases;
         sreq.filter = filter;
         rlen = fmt_ldapsearchrequest(buf + 100, &sreq);
         mlen = fmt_ldapmessage(0, ++msgid, OP_SEARCHREQUEST, rlen);
         fmt_ldapmessage(buf + 100 - mlen, msgid, OP_SEARCHREQUEST, rlen);
         free_ldapfilter(filter);
-        timeout.sec = server->sendwait;
         // Send request
-        if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &timeout) <= 0) {
-            Tcl_AppendResult(interp, "timeout sending search request to ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
+        if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &sendtimeout) <= 0) {
+            Tcl_AppendResult(interp, "timeout sending search request to ", hoststr, " ", strerror(errno), 0);
             close(sock);
             return TCL_ERROR;
         }
-        timeout.sec = server->recvwait;
         Ns_DStringInit(&ds);
         len = 0;
         while (1) {
             // Wait for the reply
-            nread = Ns_SockRecv(sock, buf + len, sizeof(buf) - len, &timeout);
+            nread = Ns_SockRecv(sock, buf + len, sizeof(buf) - len, &recvtimeout);
             if (nread <= 0) {
-                Tcl_AppendResult(interp, "timeout reading search reply from ", Tcl_GetString(objv[2]), " ", strerror(errno), 0);
+                Tcl_AppendResult(interp, "timeout reading search reply from ", hoststr, " ", strerror(errno), 0);
                 goto err;
             }
             len += nread;
@@ -1067,7 +1108,8 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
                 goto done;
 
             default:
-                Tcl_AppendResult(interp, "invalid search response from ", Tcl_GetString(objv[2]), 0);
+                sprintf(buf, "%d", op);
+                Tcl_AppendResult(interp, "invalid search response from ", hoststr, ": ", buf, 0);
                 goto err;
             }
             mlen += nread;
@@ -1079,9 +1121,10 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
             }
         }
 done:
-        mlen = fmt_ldapmessage(buf, ++msgid, OP_UNBINDREQUEST, 0);
-        timeout.sec = 0;
-        Ns_SockSend(sock, buf, mlen, &timeout);
+        if (bind) {
+            mlen = fmt_ldapmessage(buf, ++msgid, OP_UNBINDREQUEST, 0);
+            Ns_SockSend(sock, buf, mlen, &sendtimeout);
+        }
         close(sock);
         Tcl_AppendResult(interp, ds.string, 0);
         Ns_DStringFree(&ds);
@@ -1116,7 +1159,7 @@ static uint32_t scan_asn1BOOLEAN(const char *src, const char *max, uint32_t *l)
     long ltmp;
 
     if ((tmp = scan_asn1int(src, max, &tc, &tt, &tag, &ltmp)) && tag == TAG_BOOLEAN) {
-        if (ltmp < 0 || src + tmp + ltmp > max) {
+        if (ltmp < 0 || src + tmp > max) {
             return 0;
         }
         *l = (uint32_t) ltmp;
@@ -1133,7 +1176,7 @@ static uint32_t scan_asn1ENUMERATED(const char *src, const char *max, uint32_t *
     long ltmp;
 
     if ((tmp = scan_asn1int(src, max, &tc, &tt, &tag, &ltmp)) && tag == TAG_ENUMERATED) {
-        if (ltmp < 0 || src + tmp + ltmp > max) {
+        if (ltmp < 0 || src + tmp > max) {
             return 0;
         }
         *l = (uint32_t) ltmp;
@@ -2845,7 +2888,7 @@ static void print_ldapsearch(Ns_DString *ds, SearchRequest* s, int clear)
     }
     Ns_DStringAppend(ds, "base {");
     Ns_DStringNAppend(ds, s->baseObject.s, s->baseObject.l);
-    Ns_DStringPrintf(ds, "} scope %s alias %s sizelimit %u timelimit %u filter {", ldapScopes[s->scope], ldapAliases[s->derefAliases], s->sizeLimit, s->timeLimit);
+    Ns_DStringPrintf(ds, "} scope %s alias %s sizelimit %u timelimit %u filter {", ldapScopes[s->scope].key, ldapAliases[s->derefAliases].key, s->sizeLimit, s->timeLimit);
     print_ldapfilter(ds, s->filter, 0);
     Ns_DStringAppend(ds, "} attributes {");
     while (attr) {
