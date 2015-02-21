@@ -408,8 +408,8 @@ typedef struct LDAPServer {
    int debug;
    int sock;
    int port;
-   char *address;
-   char *proc;
+   const char *address;
+   const char *proc;
 } LDAPServer;
 
 typedef struct LDAPRequest {
@@ -443,8 +443,10 @@ static int LDAPRequestProc(void *arg, Ns_Conn *conn);
 static int LDAPRequestReply(LDAPRequest *req, char *buf, int op);
 static int LDAPRequestReplySRE(LDAPRequest *req, SearchResultEntry *sre);
 static void LDAPRequestTcl(LDAPRequest *req);
-static int LDAPInterpInit(Tcl_Interp *interp, void *arg);
 static int LDAPCmd(ClientData arg, Tcl_Interp *interp,int objc,Tcl_Obj *CONST objv[]);
+
+static Ns_TclTraceProc LDAPInterpInit;
+
 
 static uint32_t scan_ldapstring(const char* src, const char* max,String* s);
 static uint32_t scan_ldapmessage(const char* src, const char* max, uint32_t* messageid,uint32_t* op, uint32_t* len);
@@ -547,7 +549,7 @@ NS_EXPORT int Ns_ModuleVersion = 1;
 
 NS_EXPORT int Ns_ModuleInit(char *server, char *module)
 {
-    char *path;
+    const char *path;
     LDAPServer *srvPtr;
     Ns_DriverInitData init = {0};
     static int initialized = 0;
@@ -598,9 +600,9 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     return NS_OK;
 }
 
-static int LDAPInterpInit(Tcl_Interp *interp, void *arg)
+static int LDAPInterpInit(Tcl_Interp *interp, const void *arg)
 {
-    Tcl_CreateObjCommand(interp, "ns_ldap", LDAPCmd, arg, NULL);
+    Tcl_CreateObjCommand(interp, "ns_ldap", LDAPCmd, (ClientData)arg, NULL);
     return NS_OK;
 }
 
@@ -650,7 +652,7 @@ static void LDAPThread(void *arg)
     LDAPRequestFree(req);
 }
 
-static int LDAPSockProc(SOCKET sock, void *arg, int when)
+static bool LDAPSockProc(NS_SOCKET sock, void *arg, int when)
 {
     LDAPServer *server = (LDAPServer*)arg;
     int slen = sizeof(struct sockaddr_in);
@@ -668,7 +670,7 @@ static int LDAPSockProc(SOCKET sock, void *arg, int when)
          }
          return NS_TRUE;
     }
-    close(sock);
+    ns_sockclose(sock);
     return NS_FALSE;
 }
 
@@ -820,7 +822,7 @@ static void LDAPRequestTcl(LDAPRequest *req)
     if (req->server->proc) {
         Tcl_Interp *interp = Ns_TclAllocateInterp(req->server->name);
         if (Tcl_VarEval(interp, req->server->proc, " ", ns_inet_ntoa(req->sa.sin_addr), NULL) != TCL_OK) {
-            Ns_TclLogError(interp);
+	    (void) Ns_TclLogErrorInfo(conn->interp, "\n(context: ldap eval)");
         }
         Ns_TclDeAllocateInterp(interp);
     }
@@ -1030,21 +1032,21 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
             // Send request
             if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &sendtimeout) <= 0) {
                 Tcl_AppendResult(interp, "timeout sending bind request to ", hoststr, ": ", strerror(errno), 0);
-                close(sock);
+                ns_sockclose(sock);
                 return TCL_ERROR;
             }
             // Wait for the reply
             len = Ns_SockRecv(sock, buf, sizeof(buf), &recvtimeout);
             if (len <= 0) {
                 Tcl_AppendResult(interp, "timeout reading bind reply from ", hoststr, " ", strerror(errno), 0);
-                close(sock);
+                ns_sockclose(sock);
                 return TCL_ERROR;
             }
             // Parse reply
             res = scan_ldapmessage(buf, buf + len, &msgid, &op, &mlen);
             if (!res || op != OP_BINDRESPONSE) {
                 Tcl_AppendResult(interp, "invalid bind response from ", hoststr, 0);
-                close(sock);
+                ns_sockclose(sock);
                 return TCL_ERROR;
             }
             res = scan_ldapbindresponse(buf + res, buf + res + mlen, &bres);
@@ -1052,7 +1054,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
                 Tcl_AppendResult(interp, "unable to bind to ", hoststr, ": ",
                                  bres.result < MAX_ERRORS ? ldapErrors[bres.result] : "", " ",
                                  bres.errmsg.s, 0);
-                close(sock);
+                ns_sockclose(sock);
                 return TCL_ERROR;
             }
         }
@@ -1060,7 +1062,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         // Parse search filter
         if (!scan_ldapsearchfilterstring(filterstr, &filter)) {
             Tcl_AppendResult(interp, "invalid filter ", filterstr, 0);
-            close(sock);
+            ns_sockclose(sock);
             return TCL_ERROR;
         }
         // Prepare Search Request
@@ -1072,7 +1074,7 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
         // Send request
         if (Ns_SockSend(sock, buf + 100 - mlen, rlen + mlen, &sendtimeout) <= 0) {
             Tcl_AppendResult(interp, "timeout sending search request to ", hoststr, " ", strerror(errno), 0);
-            close(sock);
+            ns_sockclose(sock);
             return TCL_ERROR;
         }
         Ns_DStringInit(&ds);
@@ -1129,12 +1131,12 @@ done:
             mlen = fmt_ldapmessage(buf, ++msgid, OP_UNBINDREQUEST, 0);
             Ns_SockSend(sock, buf, mlen, &sendtimeout);
         }
-        close(sock);
+        ns_sockclose(sock);
         Tcl_AppendResult(interp, ds.string, 0);
         Ns_DStringFree(&ds);
         return TCL_OK;
 err:
-        close(sock);
+        ns_sockclose(sock);
         Ns_DStringFree(&ds);
         return TCL_ERROR;
     }

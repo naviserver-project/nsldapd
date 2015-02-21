@@ -10,7 +10,7 @@ MOD      =  nsldapd.so
 #
 # Objects to build.
 #
-OBJS     = nsldapd.o
+MODOBJS     = nsldapd.o
 
 PROCS   = ldapd_procs.tcl
 
