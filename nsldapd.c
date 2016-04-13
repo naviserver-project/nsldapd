@@ -414,7 +414,7 @@ typedef struct LDAPServer {
 
 typedef struct LDAPRequest {
    LDAPServer *server;
-   struct sockaddr_in sa;
+   struct NS_SOCKADDR_STORAGE sa;
    Ns_DString ds;
    int sock;
    int authenticated;
@@ -431,22 +431,27 @@ typedef struct LDAPRequest {
      BindRequest bind;
      SearchRequest search;
      ModifyRequest modify;
-   };
+   } data;
 } LDAPRequest;
 
 static Ns_SockProc LDAPSockProc;
-static Ns_DriverProc LDAPDriverProc;
+
+// static Ns_DriverProc LDAPDriverProc;
+static Ns_DriverAcceptProc LDAPAcceptProc;
+static Ns_DriverListenProc LDAPListenProc;
+static Ns_DriverRequestProc LDAPRequestProc;
+static Ns_DriverCloseProc LDAPCloseProc;
+
 static LDAPRequest *LDAPRequestNew(LDAPServer *server);
 static void LDAPRequestProcess(LDAPRequest *arg);
 static void LDAPRequestFree(LDAPRequest *req);
-static int LDAPRequestProc(void *arg, Ns_Conn *conn);
+//static int LDAPRequestProc(void *arg, Ns_Conn *conn);
 static int LDAPRequestReply(LDAPRequest *req, char *buf, int op);
 static int LDAPRequestReplySRE(LDAPRequest *req, SearchResultEntry *sre);
 static void LDAPRequestTcl(LDAPRequest *req);
-static int LDAPCmd(ClientData arg, Tcl_Interp *interp,int objc,Tcl_Obj *CONST objv[]);
 
+static Tcl_ObjCmdProc LDAPCmd;
 static Ns_TclTraceProc LDAPInterpInit;
-
 
 static uint32_t scan_ldapstring(const char* src, const char* max,String* s);
 static uint32_t scan_ldapmessage(const char* src, const char* max, uint32_t* messageid,uint32_t* op, uint32_t* len);
@@ -546,8 +551,10 @@ const char *ldapErrors[] = { "success", "operationserror", "protocolerror", "tim
 static Ns_Tls ldapTls;
 
 NS_EXPORT int Ns_ModuleVersion = 1;
+NS_EXPORT Ns_ModuleInitProc Ns_ModuleInit;
 
-NS_EXPORT int Ns_ModuleInit(char *server, char *module)
+
+NS_EXPORT int Ns_ModuleInit(const char *server, const char *module)
 {
     const char *path;
     LDAPServer *srvPtr;
@@ -575,12 +582,23 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     srvPtr->recvwait = Ns_ConfigIntRange(path, "recvwait", 30, 1, INT_MAX);
 
     if (srvPtr->drivermode) {
-        init.version = NS_DRIVER_VERSION_1;
+        init.version = NS_DRIVER_VERSION_2;
         init.name = "nsldapd";
-        init.proc = LDAPDriverProc;
-        init.opts = NS_DRIVER_QUEUE_ONACCEPT;
+        //init.proc = LDAPDriverProc;
+        //init.opts = NS_DRIVER_QUEUE_ONACCEPT;
+
+	init.listenProc = LDAPListenProc;
+	init.acceptProc = LDAPAcceptProc;
+	init.recvProc = NULL; //LDAPRecvProc;
+	init.sendProc = NULL; // LDAPSendProc;
+	init.sendFileProc = NULL; // LDAPSendFileProc;
+	init.keepProc = NULL; // LDAPKeepProc;
+	init.requestProc = LDAPRequestProc;
+	init.closeProc = LDAPCloseProc;
+	init.opts = NS_DRIVER_ASYNC|NS_DRIVER_NOPARSE;
+	
         init.arg = srvPtr;
-        init.path = NULL;
+        init.path = path;
         if (Ns_DriverInit(server, module, &init) != NS_OK) {
             Ns_Log(Error, "nsldapd: driver init failed.");
             ns_free(srvPtr);
@@ -606,6 +624,113 @@ static int LDAPInterpInit(Tcl_Interp *interp, const void *arg)
     return NS_OK;
 }
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * LDAPAcceptProc --
+ *
+ *      Accept a new socket in non-blocking mode.
+ *
+ * Results:
+ *      possible results:
+ *      NS_DRIVER_ACCEPT:       a socket was accepted, poll for data
+ *      NS_DRIVER_ACCEPT_DATA:  a socket was accepted, data present, read immediately
+ *                      if in async mode, defer reading to connection thread
+ *      NS_DRIVER_ACCEPT_QUEUE: a socket was accepted, queue immediately
+ *      NS_DRIVER_ACCEPT_ERROR: no socket was accepted
+ *
+ *     This function returns either NS_DRIVER_ACCEPT_QUEUE or
+ *     NS_DRIVER_ACCEPT_ERROR
+ *
+ * Side effects:
+ *      None.
+ *
+ *----------------------------------------------------------------------
+ */
+ 
+static NS_DRIVER_ACCEPT_STATUS 
+LDAPAcceptProc(Ns_Sock *sock, NS_SOCKET listensock, struct sockaddr *sockaddrPtr, socklen_t *socklenPtr)
+{
+    int     status = NS_DRIVER_ACCEPT_ERROR;
+
+    Ns_Log(Debug,"LDAPAcceptProc");
+    /*
+     * This function is essentially copied from nssocket.c but returns
+     * on success NS_DRIVER_ACCEPT_QUEUE.
+     */
+
+    sock->sock = Ns_SockAccept(listensock, sockaddrPtr, socklenPtr);
+    if (sock->sock != NS_INVALID_SOCKET) {
+
+#ifdef __APPLE__
+      /* 
+       * Darwin's poll returns per default writable in situations,
+       * where nothing can be written.  Setting the socket option for
+       * the send low watermark to 1 fixes this problem.
+       */
+        int value = 1;
+	setsockopt(sock->sock, SOL_SOCKET,SO_SNDLOWAT, &value, sizeof(value));
+#endif
+	status = NS_DRIVER_ACCEPT_QUEUE;
+    }
+    return status;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * LDAPListenProc --
+ *
+ *      Open a listening socket in non-blocking mode.
+ *
+ * Results:
+ *      The open socket or NS_INVALID_SOCKET on error.
+ *
+ * Side effects:
+ *      None
+ *
+ *----------------------------------------------------------------------
+ */
+
+static NS_SOCKET LDAPListenProc(Ns_Driver *driver, CONST char *address, int port, int backlog)
+{
+    NS_SOCKET sock;
+    LDAPServer *srvPtr = (LDAPServer *)driver->arg;
+
+    Ns_Log(Debug,"LDAPListenProc");
+
+    sock = Ns_SockListenEx(srvPtr->address, srvPtr->port,backlog);
+    if (sock != NS_INVALID_SOCKET) {
+        (void) Ns_SockSetNonBlocking(sock);
+    }
+    return sock;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * LDAPCloseProc --
+ *
+ *      Close an Smptd proc (finish the request)
+ *
+ * Results:
+ *      None
+ *
+ * Side effects:
+ *      None
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void LDAPCloseProc(Ns_Sock *sock)
+{
+  Ns_Log(Debug,"LDAPCloseProc");
+  sock->sock=-1;
+}
+
+#if 0
 static int LDAPDriverProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, int nbufs)
 {
     Ns_Time timeout = {0,0};
@@ -631,12 +756,15 @@ static int LDAPDriverProc(Ns_DriverCmd cmd, Ns_Sock *sock, struct iovec *bufs, i
     }
     return NS_ERROR;
 }
+#endif
 
 static int LDAPRequestProc(void *arg, Ns_Conn *conn)
 {
     LDAPServer *server = (LDAPServer*)arg;
     Ns_Sock *sock = Ns_ConnSockPtr(conn);
     LDAPRequest *req = LDAPRequestNew(server);
+
+    Ns_Log(Debug,"LDAPRequestProc");
 
     req->sa = sock->sa;
     req->sock = sock->sock;
@@ -652,10 +780,10 @@ static void LDAPThread(void *arg)
     LDAPRequestFree(req);
 }
 
-static bool LDAPSockProc(NS_SOCKET sock, void *arg, int when)
+static bool LDAPSockProc(NS_SOCKET sock, void *arg, unsigned int when)
 {
     LDAPServer *server = (LDAPServer*)arg;
-    int slen = sizeof(struct sockaddr_in);
+    socklen_t slen = (socklen_t)sizeof(struct NS_SOCKADDR_STORAGE);
     LDAPRequest *req;
 
     switch(when) {
@@ -695,12 +823,15 @@ static void LDAPRequestFree(LDAPRequest *req)
 
 static void LDAPRequestProcess(LDAPRequest* req)
 {
-    char buf[4096];
+    char    buf[4096];
     Ns_Time timeout = { 0, 0 };
-    int nread, len = 0;
+    int     nread, len = 0;
+    struct  sockaddr *saPtr = (struct sockaddr *)&(req->sa);
+    char    ipString[NS_IPADDR_SIZE];
 
     if (req->server->debug > 1) {
-        Ns_Log(Notice, "LDAP: FD %d: %s: connected", req->sock, ns_inet_ntoa(req->sa.sin_addr));
+        Ns_Log(Notice, "LDAP: FD %d: %s: connected", req->sock,
+               ns_inet_ntop(saPtr, ipString, sizeof(ipString)));
     }
 
     Ns_TlsSet(&ldapTls, req);
@@ -712,7 +843,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             goto err;
         }
         if (req->server->debug > 3) {
-            Ns_Log(Notice, "LDAP: FD %d: %s: read %d bytes", req->sock, ns_inet_ntoa(req->sa.sin_addr), nread);
+            Ns_Log(Notice, "LDAP: FD %d: %s: read %d bytes", req->sock,
+                   ns_inet_ntop(saPtr, ipString, sizeof(ipString)),
+                   nread);
         }
         len += nread;
         nread = scan_ldapmessage(buf, buf + len, &req->msgid, &req->op, &req->msglen);
@@ -720,18 +853,23 @@ static void LDAPRequestProcess(LDAPRequest* req)
             continue;
         }
         if (req->server->debug > 2) {
-            Ns_Log(Notice, "LDAP: FD %d: %s: op %s(%u), msgid %u, len %u bytes", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->op < MAX_OPS ? ldapOps[req->op] : "unknown", req->op, req->msgid, req->msglen);
+            Ns_Log(Notice, "LDAP: FD %d: %s: op %s(%u), msgid %u, len %u bytes", req->sock,
+                   ns_inet_ntop(saPtr, ipString, sizeof(ipString)),
+                   req->op < MAX_OPS ? ldapOps[req->op] : "unknown",
+                   req->op, req->msgid, req->msglen);
         }
         switch (req->op) {
         case OP_BINDREQUEST: {
-            if (scan_ldapbindrequest(buf + nread, buf + len, &req->bind) > 0) {
+            if (scan_ldapbindrequest(buf + nread, buf + len, &req->data.bind) > 0) {
                 LDAPRequestTcl(req);
             } else {
                 req->reply.rc = LDAP_PROTOCOLERROR;
             }
             if (req->server->debug > 2) {
-                print_ldapbind(&req->ds, &req->bind, 1);
-                Ns_Log(Notice, "LDAP: FD %d: %s: %u bind: %s", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->msgid, req->ds.string);
+                print_ldapbind(&req->ds, &req->data.bind, 1);
+                Ns_Log(Notice, "LDAP: FD %d: %s: %u bind: %s", req->sock,
+                       ns_inet_ntop(saPtr, ipString, sizeof(ipString)),
+                       req->msgid, req->ds.string);
             }
             req->authenticated = req->reply.rc ? 0 : 1;
             if (LDAPRequestReply(req, buf, OP_BINDRESPONSE) <= 0) {
@@ -741,13 +879,15 @@ static void LDAPRequestProcess(LDAPRequest* req)
         }
 
         case OP_SEARCHREQUEST: {
-            if (scan_ldapsearchrequest(buf + nread, buf + len, &req->search) > 0) {
+            if (scan_ldapsearchrequest(buf + nread, buf + len, &req->data.search) > 0) {
                 if (req->server->debug > 2) {
-                    print_ldapsearch(&req->ds, &req->search, 1);
-                    Ns_Log(Notice, "LDAP: FD %d: %s: %u search: %s", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->msgid, req->ds.string);
+                    print_ldapsearch(&req->ds, &req->data.search, 1);
+                    Ns_Log(Notice, "LDAP: FD %d: %s: %u search: %s", req->sock,
+                           ns_inet_ntop(saPtr, ipString, sizeof(ipString)),
+                           req->msgid, req->ds.string);
                 }
                 LDAPRequestTcl(req);
-                free_ldapsearchrequest(&req->search);
+                free_ldapsearchrequest(&req->data.search);
             } else {
                 req->reply.rc = LDAP_PROTOCOLERROR;
             }
@@ -758,9 +898,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
         }
 
         case OP_MODIFYREQUEST:
-            if (scan_ldapmodifyrequest(buf + nread, buf + len, &req->modify) > 0) {
+            if (scan_ldapmodifyrequest(buf + nread, buf + len, &req->data.modify) > 0) {
                 LDAPRequestTcl(req);
-                free_ldapmodifyrequest(&req->modify);
+                free_ldapmodifyrequest(&req->data.modify);
             } else {
                 req->reply.rc = LDAP_PROTOCOLERROR;
             }
@@ -770,9 +910,9 @@ static void LDAPRequestProcess(LDAPRequest* req)
             break;
 
         case OP_ADDREQUEST:
-            if (scan_ldapaddrequest(buf + nread, buf + len, &req->modify) > 0) {
+            if (scan_ldapaddrequest(buf + nread, buf + len, &req->data.modify) > 0) {
                 LDAPRequestTcl(req);
-                free_ldapaddrequest(&req->modify);
+                free_ldapaddrequest(&req->data.modify);
             } else {
                 req->reply.rc = LDAP_OPERATIONSERROR;
             }
@@ -806,7 +946,9 @@ done:
     Ns_TlsSet(&ldapTls, 0);
 
     if (req->server->debug > 1) {
-        Ns_Log(Notice, "LDAP: FD %d: %s: %u disconnected", req->sock, ns_inet_ntoa(req->sa.sin_addr), req->msgid);
+        Ns_Log(Notice, "LDAP: FD %d: %s: %u disconnected", req->sock,
+               ns_inet_ntop(saPtr, ipString, sizeof(ipString)),
+               req->msgid);
     }
     return;
 
@@ -821,8 +963,12 @@ static void LDAPRequestTcl(LDAPRequest *req)
 {
     if (req->server->proc) {
         Tcl_Interp *interp = Ns_TclAllocateInterp(req->server->name);
-        if (Tcl_VarEval(interp, req->server->proc, " ", ns_inet_ntoa(req->sa.sin_addr), NULL) != TCL_OK) {
-	    (void) Ns_TclLogErrorInfo(conn->interp, "\n(context: ldap eval)");
+        struct      sockaddr *saPtr = (struct sockaddr *)&(req->sa);
+        char        ipString[NS_IPADDR_SIZE];
+
+        if (Tcl_VarEval(interp, req->server->proc, " ",
+                        ns_inet_ntop(saPtr, ipString, sizeof(ipString)), NULL) != TCL_OK) {
+	    (void) Ns_TclLogErrorInfo(interp, "\n(context: ldap eval)");
         }
         Ns_TclDeAllocateInterp(interp);
     }
@@ -834,7 +980,10 @@ static int LDAPRequestReply(LDAPRequest *req, char *buf, int op)
     char *outptr = buf + 100;
     Ns_Time timeout = {req->server->sendwait, 0};
 
-    rlen = fmt_ldapresult(outptr, req->reply.rc, fmt_str(req->reply.dn), fmt_str(req->reply.errmsg), fmt_str(req->reply.referral));
+    rlen = fmt_ldapresult(outptr, req->reply.rc,
+                          fmt_str(req->reply.dn),
+                          fmt_str(req->reply.errmsg),
+                          fmt_str(req->reply.referral));
     mlen = fmt_ldapmessage(0, req->msgid, op, rlen);
     fmt_ldapmessage(outptr - mlen, req->msgid, op, rlen);
     return Ns_SockSend(req->sock, outptr - mlen, rlen + mlen, &timeout);
@@ -900,22 +1049,25 @@ static int LDAPCmd(ClientData arg, Tcl_Interp *interp, int objc, Tcl_Obj *CONST 
             Ns_DStringPrintf(&req->ds, "%u", req->msgid);
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "ipaddr")) {
-            Ns_DStringAppend(&req->ds, ns_inet_ntoa(req->sa.sin_addr));
+            struct sockaddr *saPtr = (struct sockaddr *)&(req->sa);
+            char   ipString[NS_IPADDR_SIZE];
+
+            Ns_DStringAppend(&req->ds, ns_inet_ntop(saPtr, ipString, sizeof(ipString)));
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "bind")) {
-            print_ldapbind(&req->ds, &req->bind, 0);
+            print_ldapbind(&req->ds, &req->data.bind, 0);
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "authenticated")) {
             Ns_DStringPrintf(&req->ds, "%d", req->authenticated);
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "search")) {
-            print_ldapsearch(&req->ds, &req->search, 0);
+            print_ldapsearch(&req->ds, &req->data.search, 0);
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "filter")) {
-            print_ldapfilter(&req->ds, req->search.filter, 0);
+            print_ldapfilter(&req->ds, req->data.search.filter, 0);
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "modify")) {
-            print_ldapmodify(&req->ds, &req->modify, 0);
+            print_ldapmodify(&req->ds, &req->data.modify, 0);
         }
         Tcl_AppendResult(interp, req->ds.string, 0);
         break;
@@ -2543,7 +2695,7 @@ static uint32_t fmt_ldapsearchfilter(char *dest, Filter *f)
         break;
 
     case PRESENT:
-        return fmt_asn1string(dest, CLASS_PRIVATE, TYPE_PRIMITIVE, f->type, f->name.s, f->name.l);
+        return fmt_asn1string(dest, CLASS_PRIVATE, TYPE_PRIMITIVE, 0/*f->type*/, f->name.s, f->name.l);
         break;
 
     case EXTENSIBLE:
@@ -2942,3 +3094,12 @@ static void print_ldapmodify(Ns_DString *ds, ModifyRequest* m, int clear)
     }
     Ns_DStringAppend(ds, "}");
 }
+
+/*
+ * Local Variables:
+ * mode: c
+ * c-basic-offset: 4
+ * fill-column: 78
+ * indent-tabs-mode: nil
+ * End:
+ */
