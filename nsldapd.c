@@ -401,8 +401,8 @@ typedef struct ModifyRequest {
 
 typedef struct LDAPServer {
    char *name;
-   int drivermode;
-   int threadmode;
+   bool drivermode;
+   bool threadmode;
    int sendwait;
    int recvwait;
    int debug;
@@ -569,10 +569,10 @@ NS_EXPORT int Ns_ModuleInit(const char *server, const char *module)
     srvPtr = ns_calloc(1, sizeof(LDAPServer));
     path = Ns_ConfigGetPath(server, module, NULL);
     if (!Ns_ConfigGetBool(path, "threadmode", &srvPtr->threadmode)) {
-        srvPtr->threadmode = 1;
+        srvPtr->threadmode = NS_TRUE;
     }
     if (!Ns_ConfigGetBool(path, "drivermode", &srvPtr->drivermode)) {
-        srvPtr->drivermode = 1;
+        srvPtr->drivermode = NS_TRUE;
     }
     srvPtr->proc = Ns_ConfigGetValue(path, "proc");
     srvPtr->address = Ns_ConfigGetValue(path, "address");
@@ -692,15 +692,14 @@ LDAPAcceptProc(Ns_Sock *sock, NS_SOCKET listensock, struct sockaddr *sockaddrPtr
  *
  *----------------------------------------------------------------------
  */
-
-static NS_SOCKET LDAPListenProc(Ns_Driver *driver, CONST char *address, int port, int backlog)
+static NS_SOCKET LDAPListenProc(Ns_Driver *driver, const char *address, unsigned short port, int backlog, bool resuseport)
 {
     NS_SOCKET sock;
     LDAPServer *srvPtr = (LDAPServer *)driver->arg;
 
     Ns_Log(Debug,"LDAPListenProc");
 
-    sock = Ns_SockListenEx(srvPtr->address, srvPtr->port,backlog);
+    sock = Ns_SockListenEx(srvPtr->address, srvPtr->port, backlog, resuseport);
     if (sock != NS_INVALID_SOCKET) {
         (void) Ns_SockSetNonBlocking(sock);
     }
